@@ -1,0 +1,24 @@
+[package]
+name = "shift-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+tokio = ["dep:tokio", "dep:socket2"]
+
+[dependencies]
+aes-gcm.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+chacha20poly1305.workspace = true
+fastrand.workspace = true
+rand_core.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+socket2 = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }

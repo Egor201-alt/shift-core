@@ -1,0 +1,27 @@
+[package]
+name = "shift-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "shift_client"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "shift-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shift-proto = { path = "../shift-proto", features = ["tokio"] }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

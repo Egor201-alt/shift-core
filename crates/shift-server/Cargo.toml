@@ -1,0 +1,26 @@
+[package]
+name = "shift-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "shift_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shift-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+shift-proto = { path = "../shift-proto", features = ["tokio"] }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+shift-client = { path = "../shift-client" }
