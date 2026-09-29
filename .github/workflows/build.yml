@@ -1,0 +1,162 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            slug: linux-x86_64
+            cross_packages: ""
+            linker_env: ""
+            server_bin: shift-server
+            cli_bin: shift-cli
+            client_lib: libshift_client.so
+          - target: aarch64-unknown-linux-gnu
+            slug: linux-arm64
+            cross_packages: "gcc-aarch64-linux-gnu"
+            linker_env: "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+            server_bin: shift-server
+            cli_bin: shift-cli
+            client_lib: libshift_client.so
+          - target: x86_64-pc-windows-gnu
+            slug: windows-x86_64
+            cross_packages: "gcc-mingw-w64-x86-64"
+            linker_env: "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc-ar"
+            server_bin: shift-server.exe
+            cli_bin: shift-cli.exe
+            client_lib: shift_client.dll
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross toolchain
+        if: matrix.cross_packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cross_packages }}
+
+      - name: Build release binaries
+        shell: bash
+        # Per-target linker overrides are exported inline because GitHub
+        # Actions matrix values are plain strings, not real env maps.
+        run: |
+          set -euo pipefail
+          export ${{ matrix.linker_env }}
+          cargo build --workspace --release --target ${{ matrix.target }}
+
+      - name: Stage artifact directory
+        run: |
+          set -euo pipefail
+          stage="dist/${{ matrix.slug }}"
+          mkdir -p "$stage"
+          out="target/${{ matrix.target }}/release"
+          cp "$out/${{ matrix.server_bin }}" "$stage/"
+          cp "$out/${{ matrix.cli_bin }}" "$stage/"
+          cp "$out/${{ matrix.client_lib }}" "$stage/"
+          cp crates/shift-client/include/shift_client.h "$stage/"
+          cp README.md "$stage/" 2>/dev/null || true
+
+      - name: Upload per-target artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shift-core-${{ matrix.slug }}
+          path: dist/${{ matrix.slug }}
+          if-no-files-found: error
+
+  bundle:
+    name: bundle combined artifact
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all per-target artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shift-core-*
+          path: dist
+
+      - name: Build combined archive
+        run: |
+          set -euo pipefail
+          cd dist
+          for dir in shift-core-*; do
+            mv "$dir" "${dir#shift-core-}"
+          done
+          zip -r ../shift-core-all-platforms.zip .
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shift-core-all-platforms
+          path: shift-core-all-platforms.zip
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download combined artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: shift-core-all-platforms
+          path: .
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: shift-core-all-platforms.zip
+          generate_release_notes: true
