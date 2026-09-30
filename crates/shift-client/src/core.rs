@@ -99,7 +99,10 @@ async fn handle_socks_client(
         .recv_frame(&mut server_stream)
         .await?
         .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof waiting for status")
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "early eof waiting for status",
+            )
         })?;
 
     let status = match status_frame.as_ref() {
