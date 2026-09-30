@@ -31,8 +31,8 @@ const GROUP_X25519: u16 = 0x001d;
 const GROUP_SECP256R1: u16 = 0x0017;
 
 const GREASE_VALUES: [u16; 16] = [
-    0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a, 0xaaaa,
-    0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa,
+    0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a, 0xaaaa, 0xbaba,
+    0xcaca, 0xdada, 0xeaea, 0xfafa,
 ];
 
 /// Picks a random GREASE value per RFC 8701. Real TLS clients (Chrome,
@@ -412,14 +412,20 @@ mod tests {
             body.advance(1 + sid_len);
             let cipher_len = u16::from_be_bytes([body[0], body[1]]) as usize;
             let first_suite = u16::from_be_bytes([body[2], body[3]]);
-            assert!(is_grease(first_suite), "first cipher suite should be GREASE");
+            assert!(
+                is_grease(first_suite),
+                "first cipher suite should be GREASE"
+            );
             body.advance(2 + cipher_len);
             body.advance(1 + body[0] as usize);
             let ext_len = u16::from_be_bytes([body[0], body[1]]) as usize;
             body.advance(2);
             let extensions = &body[..ext_len];
             let first_ext_type = u16::from_be_bytes([extensions[0], extensions[1]]);
-            assert!(is_grease(first_ext_type), "first extension should be GREASE");
+            assert!(
+                is_grease(first_ext_type),
+                "first extension should be GREASE"
+            );
 
             let mut cursor = extensions;
             let mut key_share_entries = 0;
@@ -442,8 +448,14 @@ mod tests {
                 }
                 cursor = &cursor[4 + len..];
             }
-            assert_eq!(key_share_entries, 2, "expected a GREASE + a real x25519 key_share entry");
-            assert!(groups_first_grease, "first supported_group should be GREASE");
+            assert_eq!(
+                key_share_entries, 2,
+                "expected a GREASE + a real x25519 key_share entry"
+            );
+            assert!(
+                groups_first_grease,
+                "first supported_group should be GREASE"
+            );
         }
     }
 
