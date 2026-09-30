@@ -16,6 +16,7 @@ use crate::{Result, ShiftError, MAX_CLOCK_SKEW_SECS, PROTOCOL_VERSION};
 pub const CLIENT_INIT_LEN: usize = 64;
 pub const SERVER_REPLY_MIN_LEN: usize = 32 + CONFIRM_LEN;
 pub const SERVER_REPLY_MAX_LEN: usize = SERVER_REPLY_MIN_LEN + TICKET_ID_LEN;
+pub const SERVER_REPLY_LEN: usize = SERVER_REPLY_MIN_LEN;
 const TOKEN_PLAIN_LEN: usize = 16;
 const REPLAY_CAPACITY: usize = 1 << 20;
 const REPLAY_PRUNE_INTERVAL_SECS: u64 = 30;
@@ -286,6 +287,7 @@ fn open_and_check_token(key: &[u8; 32], token: &[u8; 32], now_unix: u64) -> Resu
 /// let this client resume later without a new Diffie-Hellman exchange.
 /// Resumed sessions never carry a fresh `resumption_secret`, so a
 /// resumption chain cannot extend past the original full handshake.
+#[derive(Debug)]
 pub struct Handshaked {
     pub keys: SessionKeys,
     pub resumption_secret: Option<[u8; 32]>,
