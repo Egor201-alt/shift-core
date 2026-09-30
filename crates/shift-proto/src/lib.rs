@@ -5,6 +5,7 @@ pub mod handshake;
 pub mod masquerade;
 pub mod morphing;
 pub mod open;
+pub mod resumption;
 #[cfg(feature = "tokio")]
 pub mod tunnel;
 
@@ -18,6 +19,7 @@ pub use handshake::{
 };
 pub use morphing::{AdaptiveShaper, FramePlan, Phase, ShaperConfig, SizeBucket, SizeProfile};
 pub use open::{Host, OpenRequest, OpenStatus, Target};
+pub use resumption::{unix_now, Ticket, TicketStore, TICKET_ID_LEN};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const LENGTH_FIELD_LEN: usize = 2;
