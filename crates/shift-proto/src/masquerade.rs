@@ -30,6 +30,34 @@ const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
 const GROUP_X25519: u16 = 0x001d;
 const GROUP_SECP256R1: u16 = 0x0017;
 
+const GREASE_VALUES: [u16; 16] = [
+    0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a, 0xaaaa,
+    0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa,
+];
+
+/// Picks a random GREASE value per RFC 8701. Real TLS clients (Chrome,
+/// Firefox, most mobile stacks) insert these reserved values at several
+/// points in the ClientHello and change them on every connection, so their
+/// *absence*, or a value that never changes, is itself a fingerprint.
+fn random_grease() -> u16 {
+    GREASE_VALUES[fastrand::usize(0..GREASE_VALUES.len())]
+}
+
+/// Two independent GREASE draws are used because real implementations
+/// (BoringSSL, and Chrome/Firefox which build on similar logic) do not
+/// reuse a single value everywhere: one covers the cipher suite, the
+/// supported_groups entry, the supported_versions entry, and the leading
+/// GREASE extension, while a second, separate one is used for the
+/// GREASE key_share entry.
+fn random_grease_pair() -> (u16, u16) {
+    let a = random_grease();
+    let mut b = random_grease();
+    while b == a {
+        b = random_grease();
+    }
+    (a, b)
+}
+
 /// Wraps `payload` in a single fake TLS 1.3 `application_data` record
 /// header, so the byte shape on the wire matches genuine post-handshake
 /// TLS traffic. `payload` must already be a complete Shift frame (or
@@ -113,6 +141,9 @@ pub fn build_client_hello(sni: &str) -> Result<BytesMut> {
     OsRng.fill_bytes(&mut session_id);
     let mut key_share_x25519 = [0u8; 32];
     OsRng.fill_bytes(&mut key_share_x25519);
+    let mut grease_key_share_byte = [0u8; 1];
+    OsRng.fill_bytes(&mut grease_key_share_byte);
+    let (grease_a, grease_b) = random_grease_pair();
 
     let mut body = Vec::with_capacity(512);
     body.extend_from_slice(&LEGACY_CLIENT_VERSION);
@@ -121,7 +152,8 @@ pub fn build_client_hello(sni: &str) -> Result<BytesMut> {
     body.extend_from_slice(&session_id);
 
     let cipher_suites: &[u16] = &[0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030];
-    body.extend_from_slice(&((cipher_suites.len() * 2) as u16).to_be_bytes());
+    body.extend_from_slice(&(((cipher_suites.len() + 1) * 2) as u16).to_be_bytes());
+    body.extend_from_slice(&grease_a.to_be_bytes());
     for suite in cipher_suites {
         body.extend_from_slice(&suite.to_be_bytes());
     }
@@ -130,6 +162,8 @@ pub fn build_client_hello(sni: &str) -> Result<BytesMut> {
     body.push(0x00);
 
     let mut extensions = Vec::with_capacity(400);
+
+    put_extension(&mut extensions, grease_a, &[]);
 
     let mut sni_body = Vec::with_capacity(sni.len() + 5);
     sni_body.extend_from_slice(&((sni.len() + 3) as u16).to_be_bytes());
@@ -141,8 +175,9 @@ pub fn build_client_hello(sni: &str) -> Result<BytesMut> {
     put_extension(&mut extensions, EXT_EC_POINT_FORMATS, &[1, 0]);
 
     let groups: &[u16] = &[GROUP_X25519, GROUP_SECP256R1];
-    let mut groups_body = Vec::with_capacity(2 + groups.len() * 2);
-    groups_body.extend_from_slice(&((groups.len() * 2) as u16).to_be_bytes());
+    let mut groups_body = Vec::with_capacity(2 + (groups.len() + 1) * 2);
+    groups_body.extend_from_slice(&(((groups.len() + 1) * 2) as u16).to_be_bytes());
+    groups_body.extend_from_slice(&grease_a.to_be_bytes());
     for group in groups {
         groups_body.extend_from_slice(&group.to_be_bytes());
     }
@@ -174,16 +209,31 @@ pub fn build_client_hello(sni: &str) -> Result<BytesMut> {
 
     put_extension(&mut extensions, EXT_SCT, &[]);
 
-    let mut key_share_body = Vec::with_capacity(38);
-    key_share_body.extend_from_slice(&36u16.to_be_bytes());
+    let mut key_share_body = Vec::with_capacity(46);
+    key_share_body.extend_from_slice(&0u16.to_be_bytes());
+    key_share_body.extend_from_slice(&grease_b.to_be_bytes());
+    key_share_body.extend_from_slice(&(grease_key_share_byte.len() as u16).to_be_bytes());
+    key_share_body.extend_from_slice(&grease_key_share_byte);
     key_share_body.extend_from_slice(&GROUP_X25519.to_be_bytes());
     key_share_body.extend_from_slice(&32u16.to_be_bytes());
     key_share_body.extend_from_slice(&key_share_x25519);
+    let entries_len = (key_share_body.len() - 2) as u16;
+    key_share_body[0..2].copy_from_slice(&entries_len.to_be_bytes());
     put_extension(&mut extensions, EXT_KEY_SHARE, &key_share_body);
 
     put_extension(&mut extensions, EXT_PSK_KEY_EXCHANGE_MODES, &[1, 1]);
 
-    put_extension(&mut extensions, EXT_SUPPORTED_VERSIONS, &[2, 0x03, 0x04]);
+    put_extension(
+        &mut extensions,
+        EXT_SUPPORTED_VERSIONS,
+        &[
+            4,
+            grease_a.to_be_bytes()[0],
+            grease_a.to_be_bytes()[1],
+            0x03,
+            0x04,
+        ],
+    );
 
     put_extension(&mut extensions, EXT_RENEGOTIATION_INFO, &[0]);
 
@@ -347,6 +397,54 @@ mod tests {
         let b = build_client_hello("example.com").unwrap();
         assert_ne!(a, b);
         assert_eq!(a.len(), b.len());
+    }
+
+    #[test]
+    fn client_hello_carries_grease_values() {
+        let is_grease = |v: u16| (v & 0x0f0f) == 0x0a0a && (v >> 8) == (v & 0xff);
+        for _ in 0..20 {
+            let record = build_client_hello("example.com").unwrap();
+            let msg = &record[RECORD_HEADER_LEN..];
+            let declared = u32::from_be_bytes([0, msg[1], msg[2], msg[3]]) as usize;
+            let mut body = &msg[4..4 + declared];
+            body.advance(2 + 32);
+            let sid_len = body[0] as usize;
+            body.advance(1 + sid_len);
+            let cipher_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+            let first_suite = u16::from_be_bytes([body[2], body[3]]);
+            assert!(is_grease(first_suite), "first cipher suite should be GREASE");
+            body.advance(2 + cipher_len);
+            body.advance(1 + body[0] as usize);
+            let ext_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+            body.advance(2);
+            let extensions = &body[..ext_len];
+            let first_ext_type = u16::from_be_bytes([extensions[0], extensions[1]]);
+            assert!(is_grease(first_ext_type), "first extension should be GREASE");
+
+            let mut cursor = extensions;
+            let mut key_share_entries = 0;
+            let mut groups_first_grease = false;
+            while cursor.len() >= 4 {
+                let ext_type = u16::from_be_bytes([cursor[0], cursor[1]]);
+                let len = u16::from_be_bytes([cursor[2], cursor[3]]) as usize;
+                let ext_body = &cursor[4..4 + len];
+                if ext_type == EXT_KEY_SHARE {
+                    let mut ks = &ext_body[2..];
+                    while ks.len() >= 4 {
+                        key_share_entries += 1;
+                        let klen = u16::from_be_bytes([ks[2], ks[3]]) as usize;
+                        ks = &ks[4 + klen..];
+                    }
+                }
+                if ext_type == EXT_SUPPORTED_GROUPS {
+                    let first_group = u16::from_be_bytes([ext_body[2], ext_body[3]]);
+                    groups_first_grease = is_grease(first_group);
+                }
+                cursor = &cursor[4 + len..];
+            }
+            assert_eq!(key_share_entries, 2, "expected a GREASE + a real x25519 key_share entry");
+            assert!(groups_first_grease, "first supported_group should be GREASE");
+        }
     }
 
     #[test]
