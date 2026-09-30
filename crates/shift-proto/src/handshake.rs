@@ -797,11 +797,16 @@ mod tests {
     #[test]
     fn ticket_is_single_use() {
         let (server, psk, public) = setup_with_resumption(3600);
-        let (reply, _, _) = full_handshake_pair(&server, &psk, public, NOW);
+        let (client, init) =
+            ClientHandshake::start(&psk, public, CipherSuite::ChaCha20Poly1305, NOW).unwrap();
+        let (reply, _) = server.accept(&init, NOW).unwrap();
         let ticket_id = reply.ticket_id.unwrap();
+        let handshaked = client.finish(&reply).unwrap();
+        let resumption_secret = handshaked.resumption_secret.unwrap();
+
         let ticket = Ticket {
             id: ticket_id,
-            secret: [9u8; 32],
+            secret: resumption_secret,
             suite: CipherSuite::ChaCha20Poly1305,
             not_after: NOW + 3600,
         };
