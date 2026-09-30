@@ -20,6 +20,9 @@ const CTX_REKEY_AEAD: &str = "shift/v1 rekey aead";
 const CTX_REKEY_LENGTH: &str = "shift/v1 rekey length";
 const CTX_PSK_PASSPHRASE: &str = "shift/v1 psk passphrase";
 const CTX_CONFIRM: &[u8] = b"shift/v1 server confirm";
+const CTX_RESUMPTION_SECRET: &str = "shift/v1 resumption secret";
+const CTX_RESUMPTION_AUTH: &str = "shift/v1 resumption auth";
+const CTX_RESUMPTION_SESSION: &str = "shift/v1 resumption session";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -328,6 +331,68 @@ pub(crate) fn open_token(
     tag: &[u8; TAG_LEN],
 ) -> Result<()> {
     Cipher::new(CipherSuite::ChaCha20Poly1305, key).open(&[0u8; NONCE_LEN], &[], ciphertext, tag)
+}
+
+/// Derives a ticket's resumption secret from the same DH outputs and
+/// transcript as the full handshake's session keys, under a distinct
+/// context string so it is cryptographically independent of them. Both
+/// sides compute this once, right after a full handshake; the server then
+/// hands the client only a random `ticket_id` to look it up by later, the
+/// client already has the secret itself.
+pub(crate) fn derive_resumption_secret(
+    psk: &Psk,
+    dh_static: &[u8; 32],
+    dh_ephemeral: &[u8; 32],
+    transcript: &[u8; 32],
+) -> [u8; KEY_LEN] {
+    let mut hasher = blake3::Hasher::new_derive_key(CTX_RESUMPTION_SECRET);
+    hasher.update(psk.as_bytes());
+    hasher.update(dh_static);
+    hasher.update(dh_ephemeral);
+    hasher.update(transcript);
+    *hasher.finalize().as_bytes()
+}
+
+/// The key used to seal/open a resumption request's token, derived from
+/// the ticket secret alone (no fresh DH output exists at redemption time).
+pub(crate) fn resumption_auth_key(secret: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
+    blake3::derive_key(CTX_RESUMPTION_AUTH, secret)
+}
+
+/// PSK-only key schedule for a resumed session: no fresh Diffie-Hellman
+/// output feeds this, so a resumed session's secrecy is bounded by the
+/// ticket secret's own protection (and the ticket's single use), not by a
+/// fresh ephemeral exchange. Callers that need forward secrecy on every
+/// reconnect should use a full handshake (`derive_session`) instead.
+pub(crate) fn derive_resumed_session(
+    role: Role,
+    suite: CipherSuite,
+    secret: &[u8; KEY_LEN],
+    client_nonce: &[u8; 16],
+    server_nonce: &[u8; 16],
+) -> (SessionKeys, [u8; KEY_LEN]) {
+    let mut hasher = blake3::Hasher::new_derive_key(CTX_RESUMPTION_SESSION);
+    hasher.update(secret);
+    hasher.update(client_nonce);
+    hasher.update(server_nonce);
+    let mut block = [0u8; KEY_LEN * 5];
+    hasher.finalize_xof().fill(&mut block);
+
+    let take = |index: usize| -> [u8; KEY_LEN] {
+        let mut out = [0u8; KEY_LEN];
+        out.copy_from_slice(&block[index * KEY_LEN..(index + 1) * KEY_LEN]);
+        out
+    };
+    let client_to_server = DirectionKeys::new(take(0), take(1));
+    let server_to_client = DirectionKeys::new(take(2), take(3));
+    let confirm_key = take(4);
+    block.zeroize();
+
+    let (send, recv) = match role {
+        Role::Client => (client_to_server, server_to_client),
+        Role::Server => (server_to_client, client_to_server),
+    };
+    (SessionKeys { send, recv, suite }, confirm_key)
 }
 
 #[cfg(test)]
