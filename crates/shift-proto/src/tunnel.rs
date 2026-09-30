@@ -167,7 +167,7 @@ pub async fn client_handshake(
     let keys = handshake.finish(&reply).map_err(io_error)?;
     let shaper = AdaptiveShaper::new(shaper.clone(), Instant::now()).map_err(io_error)?;
     Ok(Established::new(
-        keys,
+        keys.keys,
         BytesMut::with_capacity(READ_CHUNK),
         shaper,
     ))
@@ -203,7 +203,7 @@ pub async fn client_handshake_masqueraded(
     let keys = handshake.finish(&reply).map_err(io_error)?;
     let shaper = AdaptiveShaper::new(shaper.clone(), Instant::now()).map_err(io_error)?;
     Ok(Established::new_with_masquerade(
-        keys,
+        keys.keys,
         BytesMut::with_capacity(READ_CHUNK),
         shaper,
         true,
