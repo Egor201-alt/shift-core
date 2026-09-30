@@ -7,8 +7,8 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{
     confirm_tag, derive_resumed_session, derive_resumption_secret, derive_session, open_token,
-    resumption_auth_key, seal_token, tags_equal, CipherSuite, Psk, Role, SessionKeys,
-    CONFIRM_LEN, TAG_LEN,
+    resumption_auth_key, seal_token, tags_equal, CipherSuite, Psk, Role, SessionKeys, CONFIRM_LEN,
+    TAG_LEN,
 };
 use crate::resumption::{unix_now as resumption_now, Ticket, TicketStore, TICKET_ID_LEN};
 use crate::{Result, ShiftError, MAX_CLOCK_SKEW_SECS, PROTOCOL_VERSION};
@@ -492,11 +492,9 @@ impl ServerHandshake {
         let resumption_secret =
             derive_resumption_secret(&self.psk, &dh_static, &dh_ephemeral, &transcript);
 
-        let ticket_id = self.ticket_ttl_secs.map(|ttl| {
-            self.tickets
-                .issue(resumption_secret, fields.suite, ttl)
-                .id
-        });
+        let ticket_id = self
+            .ticket_ttl_secs
+            .map(|ttl| self.tickets.issue(resumption_secret, fields.suite, ttl).id);
 
         let reply = ServerReply {
             ephemeral_public,
