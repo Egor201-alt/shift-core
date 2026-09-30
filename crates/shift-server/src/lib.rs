@@ -92,9 +92,14 @@ pub async fn handle_connection_plain(
         return Ok(());
     }
 
+    let remainder = if init_buf.len() > CLIENT_INIT_LEN {
+        init_buf.split_off(CLIENT_INIT_LEN)
+    } else {
+        BytesMut::with_capacity(4096)
+    };
+
     let shaper = AdaptiveShaper::new(runtime.shaper.clone(), Instant::now())?;
-    let session =
-        Established::new_with_masquerade(keys.keys, BytesMut::with_capacity(4096), shaper, true);
+    let session = Established::new(keys.keys, remainder, shaper);
     finish_connection(stream, peer, runtime, session).await
 }
 
