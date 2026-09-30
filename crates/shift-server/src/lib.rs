@@ -167,7 +167,8 @@ pub async fn handle_connection_masqueraded(
     }
 
     let shaper = AdaptiveShaper::new(runtime.shaper.clone(), Instant::now())?;
-    let session = Established::new_with_masquerade(keys.keys, BytesMut::with_capacity(4096), shaper, true);
+    let session =
+        Established::new_with_masquerade(keys.keys, BytesMut::with_capacity(4096), shaper, true);
     finish_connection(stream, peer, runtime, session).await
 }
 
