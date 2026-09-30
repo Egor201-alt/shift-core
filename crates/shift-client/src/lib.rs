@@ -1,6 +1,6 @@
 pub mod core;
-pub mod socks5;
 pub mod pool;
+pub mod socks5;
 
 pub use crate::core::{ClientConfig, PskSource, RunningClient};
 
