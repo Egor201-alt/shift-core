@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.0.0"
-SHIFT_REPO="${SHIFT_REPO:-your-org/shift-core}"
+SHIFT_REPO="${SHIFT_REPO:-Egor201-alt/shift-core}"
 SHIFT_RELEASE="${SHIFT_RELEASE:-latest}"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/shift"
