@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use tokio::net::TcpStream;
 
-use shift_proto::tunnel::{client_handshake, client_handshake_masqueraded, relay, tune_socket};
-use shift_proto::{CipherSuite, OpenRequest, OpenStatus, Psk, ShaperConfig};
+use shift_proto::tunnel::relay;
+use shift_proto::{CipherSuite, OpenRequest, OpenStatus, Psk};
 
+use crate::pool::ConnectionPool;
 use crate::socks5::{read_connect_request, reply_failure, reply_success, Socks5Listener};
 
 #[derive(Clone, Debug)]
@@ -54,6 +55,7 @@ pub async fn run_socks5(config: ClientConfig, bind: SocketAddr) -> std::io::Resu
     let stop = Arc::new(AtomicBool::new(false));
     let loop_stop = Arc::clone(&stop);
     let config = Arc::new(config);
+    let pool = ConnectionPool::spawn(Arc::clone(&config), 4, Arc::clone(&stop));
 
     tokio::spawn(async move {
         loop {
@@ -68,8 +70,9 @@ pub async fn run_socks5(config: ClientConfig, bind: SocketAddr) -> std::io::Resu
                 }
             };
             let config = Arc::clone(&config);
+            let pool = pool.clone();
             tokio::spawn(async move {
-                if let Err(err) = handle_socks_client(client, config).await {
+                if let Err(err) = handle_socks_client(client, config, pool).await {
                     tracing::debug!(%peer, error = %err, "socks5 connection ended");
                 }
             });
@@ -81,58 +84,26 @@ pub async fn run_socks5(config: ClientConfig, bind: SocketAddr) -> std::io::Resu
 
 async fn handle_socks_client(
     mut client: TcpStream,
-    config: Arc<ClientConfig>,
+    _config: Arc<ClientConfig>,
+    pool: ConnectionPool,
 ) -> std::io::Result<()> {
     let target = read_connect_request(&mut client).await?;
-    let psk = config
-        .psk
-        .resolve()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
-
-    let mut server_stream = TcpStream::connect(&config.server_addr).await?;
-    tune_socket(&server_stream)?;
-
-    let shaper = ShaperConfig::default();
-    let mut session = match &config.camouflage_sni {
-        Some(sni) => {
-            client_handshake_masqueraded(
-                &mut server_stream,
-                &psk,
-                config.server_public_key,
-                config.cipher,
-                &shaper,
-                config.connect_timeout,
-                sni,
-            )
-            .await?
-        }
-        None => {
-            client_handshake(
-                &mut server_stream,
-                &psk,
-                config.server_public_key,
-                config.cipher,
-                &shaper,
-                config.connect_timeout,
-            )
-            .await?
-        }
-    };
+    let (mut server_stream, mut session) = pool.acquire().await?;
 
     let request = OpenRequest::Connect(target.clone())
         .encode()
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
     session.send(&mut server_stream, &request).await?;
 
-    let status_frame = tokio::time::timeout(
-        config.connect_timeout,
-        session.recv_frame(&mut server_stream),
-    )
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "open status timed out"))??;
+    let status_frame = session
+        .recv_frame(&mut server_stream)
+        .await?
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof waiting for status")
+        })?;
 
-    let status = match status_frame.as_deref() {
-        Some([byte]) => OpenStatus::from_byte(*byte)
+    let status = match status_frame.as_ref() {
+        [byte] => OpenStatus::from_byte(*byte)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?,
         _ => {
             return Err(std::io::Error::new(
