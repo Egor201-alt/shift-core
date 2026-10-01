@@ -10,7 +10,7 @@ use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use shift_proto::masquerade::{self, RECORD_APPLICATION_DATA, RECORD_HANDSHAKE, RECORD_HEADER_LEN};
+use shift_proto::masquerade::{self, ParsedClientHello, RECORD_HANDSHAKE, RECORD_HEADER_LEN};
 use shift_proto::tunnel::{tune_socket, unix_now, Established};
 use shift_proto::{
     AdaptiveShaper, ClientInit, Host, OpenRequest, OpenStatus, ServerHandshake, Target,
@@ -112,69 +112,73 @@ pub async fn handle_connection_masqueraded(
     tune_socket(&stream)?;
 
     let mut capture = BytesMut::new();
-    let (sni, consumed) =
+    let (hello, consumed) =
         match read_client_hello(&mut stream, &mut capture, runtime.handshake_timeout).await {
             Ok(pair) => pair,
             Err(FallbackNow) => {
-                let target = runtime.fallback.to_string();
-                fallback::drain_to_decoy(stream, capture, &target, runtime.fallback_drain).await;
+                decoy_fallback(stream, capture, None, &runtime).await;
                 return Ok(());
             }
         };
-    let fallback_target = sni
-        .clone()
-        .map(|host| format!("{host}:{}", runtime.camouflage_port))
-        .unwrap_or_else(|| runtime.fallback.to_string());
 
-    let init_body = match read_client_init_record(
+    let Some(init) = hello.client_init() else {
+        decoy_fallback(stream, capture, hello.server_name.as_deref(), &runtime).await;
+        return Ok(());
+    };
+
+    let (reply, keys) = match server.accept(&init, unix_now()) {
+        Ok(pair) => pair,
+        Err(err) => {
+            tracing::debug!(%peer, error = %err, sni = ?hello.server_name, "handshake rejected, falling back to decoy");
+            decoy_fallback(stream, capture, hello.server_name.as_deref(), &runtime).await;
+            return Ok(());
+        }
+    };
+
+    let shaper = AdaptiveShaper::new(runtime.shaper.clone(), Instant::now())?;
+    let mut session = Established::new_with_masquerade(keys.keys, BytesMut::new(), shaper, true);
+
+    let mut flight = BytesMut::with_capacity(8192);
+    masquerade::build_server_hello(&init, &reply, &hello.cipher_suites, &mut flight);
+    session.encode_cover_records(&masquerade::server_flight_record_lens(), &mut flight)?;
+    let sent = tokio::time::timeout(runtime.handshake_timeout, stream.write_all(&flight)).await;
+    if !matches!(sent, Ok(Ok(()))) {
+        return Ok(());
+    }
+
+    let after_spec = consumed + masquerade::CHANGE_CIPHER_SPEC_RECORD.len();
+    if read_change_cipher_spec(
         &mut stream,
         &mut capture,
         consumed,
         runtime.handshake_timeout,
     )
     .await
-    {
-        Ok(body) => body,
-        Err(FallbackNow) => {
-            fallback::drain_to_decoy(stream, capture, &fallback_target, runtime.fallback_drain)
-                .await;
-            return Ok(());
-        }
-    };
-
-    let init = match ClientInit::from_bytes(&init_body) {
-        Ok(init) => init,
-        Err(_) => {
-            fallback::drain_to_decoy(stream, capture, &fallback_target, runtime.fallback_drain)
-                .await;
-            return Ok(());
-        }
-    };
-
-    let (reply, keys) = match server.accept(&init, unix_now()) {
-        Ok(pair) => pair,
-        Err(err) => {
-            tracing::debug!(%peer, error = %err, sni = ?sni, "handshake rejected, falling back to decoy");
-            fallback::drain_to_decoy(stream, capture, &fallback_target, runtime.fallback_drain)
-                .await;
-            return Ok(());
-        }
-    };
-
-    if tokio::time::timeout(
-        runtime.handshake_timeout,
-        masquerade::write_application_data(&mut stream, &reply.to_bytes()),
-    )
-    .await
     .is_err()
     {
         return Ok(());
     }
+    let remainder = capture.split_off(after_spec);
+    session.feed_leftover(&remainder);
 
-    let shaper = AdaptiveShaper::new(runtime.shaper.clone(), Instant::now())?;
-    let session =
-        Established::new_with_masquerade(keys.keys, BytesMut::with_capacity(4096), shaper, true);
     finish_connection(stream, peer, runtime, session).await
+}
+
+async fn decoy_fallback(
+    stream: TcpStream,
+    capture: BytesMut,
+    sni: Option<&str>,
+    runtime: &RuntimeConfig,
+) {
+    let candidates = fallback::decoy_candidates(
+        sni,
+        runtime.camouflage_port,
+        runtime.fallback,
+        runtime.forward,
+        runtime.fallback_drain,
+    )
+    .await;
+    fallback::drain_to_decoy_chain(stream, capture, &candidates, runtime.fallback_drain).await;
 }
 
 /// Common tail shared by both accept paths once a `Established` session is
@@ -224,7 +228,7 @@ async fn finish_connection(
 struct FallbackNow;
 
 /// Reads the ClientHello record from the start of the connection. Returns
-/// its parsed SNI (if any) alongside how many bytes of `capture` it
+/// its parsed fields alongside how many bytes of `capture` it
 /// occupies, so the next stage knows where to continue reading from.
 /// `capture` may end up holding a few bytes beyond that boundary already —
 /// TCP has no message framing, so a single `read_buf` can pull in the
@@ -234,7 +238,7 @@ async fn read_client_hello(
     stream: &mut TcpStream,
     capture: &mut BytesMut,
     timeout: Duration,
-) -> Result<(Option<String>, usize), FallbackNow> {
+) -> Result<(ParsedClientHello, usize), FallbackNow> {
     let read = async {
         if !ensure_captured(stream, capture, RECORD_HEADER_LEN).await {
             return Err(FallbackNow);
@@ -252,7 +256,7 @@ async fn read_client_hello(
         }
         let body = &capture[RECORD_HEADER_LEN..total];
         match masquerade::parse_client_hello(body) {
-            Ok(parsed) => Ok((parsed.server_name, total)),
+            Ok(parsed) => Ok((parsed, total)),
             Err(_) => Err(FallbackNow),
         }
     };
@@ -262,33 +266,24 @@ async fn read_client_hello(
     }
 }
 
-/// Reads the application-data-wrapped `ClientInit` record starting at
-/// absolute offset `offset` within `capture` (the end of the ClientHello
-/// stage). See [`read_client_hello`] for why offsets are absolute.
-async fn read_client_init_record(
+/// Waits for the client's ChangeCipherSpec record at absolute offset
+/// `offset` within `capture`, the last step of the TLS-shaped handshake.
+/// See [`read_client_hello`] for why offsets are absolute.
+async fn read_change_cipher_spec(
     stream: &mut TcpStream,
     capture: &mut BytesMut,
     offset: usize,
     timeout: Duration,
-) -> Result<BytesMut, FallbackNow> {
+) -> Result<(), FallbackNow> {
+    let total = offset + masquerade::CHANGE_CIPHER_SPEC_RECORD.len();
     let read = async {
-        let header_total = offset + RECORD_HEADER_LEN;
-        if !ensure_captured(stream, capture, header_total).await {
-            return Err(FallbackNow);
-        }
-        if capture[offset] != RECORD_APPLICATION_DATA {
-            return Err(FallbackNow);
-        }
-        let len = u16::from_be_bytes([capture[offset + 3], capture[offset + 4]]) as usize;
-        if len != CLIENT_INIT_LEN {
-            return Err(FallbackNow);
-        }
-        let body_start = header_total;
-        let total = body_start + len;
         if !ensure_captured(stream, capture, total).await {
             return Err(FallbackNow);
         }
-        Ok(BytesMut::from(&capture[body_start..total]))
+        if capture[offset..total] != masquerade::CHANGE_CIPHER_SPEC_RECORD[..] {
+            return Err(FallbackNow);
+        }
+        Ok(())
     };
     match tokio::time::timeout(timeout, read).await {
         Ok(result) => result,
