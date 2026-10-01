@@ -5,10 +5,12 @@ use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::masquerade::{self, RECORD_APPLICATION_DATA};
+use crate::masquerade::{
+    self, RECORD_APPLICATION_DATA, RECORD_CHANGE_CIPHER_SPEC, RECORD_HANDSHAKE, RECORD_HEADER_LEN,
+};
 use crate::{
     codec_pair, AdaptiveShaper, CipherSuite, ClientHandshake, FrameDecoder, FrameEncoder, Psk,
-    ServerReply, SessionKeys, ShaperConfig, ShiftError, SERVER_REPLY_LEN,
+    ServerReply, SessionKeys, ShaperConfig, ShiftError, FRAME_OVERHEAD, SERVER_REPLY_LEN,
 };
 
 pub const READ_CHUNK: usize = 64 * 1024;
@@ -36,6 +38,7 @@ pub struct Established {
     encoder: FrameEncoder,
     decoder: FrameDecoder,
     inbound: BytesMut,
+    raw: BytesMut,
     shaper: AdaptiveShaper,
     masquerade: bool,
 }
@@ -45,20 +48,55 @@ impl Established {
         Self::new_with_masquerade(keys, inbound, shaper, false)
     }
 
+    /// `leftover` holds bytes already read past the handshake: raw TLS
+    /// records when `masquerade` is set, plain Shift frames otherwise.
     pub fn new_with_masquerade(
         keys: SessionKeys,
-        inbound: BytesMut,
+        leftover: BytesMut,
         shaper: AdaptiveShaper,
         masquerade: bool,
     ) -> Self {
         let (encoder, decoder) = codec_pair(keys);
+        let (inbound, raw) = if masquerade {
+            (BytesMut::with_capacity(READ_CHUNK), leftover)
+        } else {
+            (leftover, BytesMut::new())
+        };
         Established {
             encoder,
             decoder,
             inbound,
+            raw,
             shaper,
             masquerade,
         }
+    }
+
+    pub fn feed_leftover(&mut self, data: &[u8]) {
+        if self.masquerade {
+            self.raw.extend_from_slice(data);
+        } else {
+            self.inbound.extend_from_slice(data);
+        }
+    }
+
+    /// Appends one fake `application_data` record per entry of
+    /// `record_lens` to `out`, each holding an empty padding-only frame
+    /// that the peer's decoder silently drops. Used to reproduce the
+    /// size pattern of the encrypted part of a real TLS 1.3 handshake.
+    pub fn encode_cover_records(
+        &mut self,
+        record_lens: &[usize],
+        out: &mut BytesMut,
+    ) -> io::Result<()> {
+        for &record_len in record_lens {
+            let mut frame = BytesMut::with_capacity(record_len);
+            self.encoder
+                .encode_cover(record_len.saturating_sub(FRAME_OVERHEAD), &mut frame)
+                .map_err(io_error)?;
+            masquerade::wrap_application_data(&frame, out).map_err(io_error)?;
+        }
+        Ok(())
     }
 
     pub async fn send<W>(&mut self, writer: &mut W, data: &[u8]) -> io::Result<()>
@@ -88,7 +126,9 @@ impl Established {
             if let Some(payload) = self.decoder.decode(&mut self.inbound).map_err(io_error)? {
                 return Ok(Some(payload));
             }
-            if !fill_maybe_wrapped(reader, &mut self.inbound, self.masquerade).await? {
+            if !fill_maybe_wrapped(reader, &mut self.inbound, &mut self.raw, self.masquerade)
+                .await?
+            {
                 return if self.inbound.is_empty() {
                     Ok(None)
                 } else {
@@ -104,39 +144,49 @@ where
     W: AsyncWrite + Unpin,
 {
     if masquerade {
-        masquerade::write_application_data(writer, payload).await
+        let records = payload.len() / masquerade::MAX_RECORD_PAYLOAD + 1;
+        let mut wrapped = BytesMut::with_capacity(payload.len() + records * RECORD_HEADER_LEN);
+        for chunk in payload.chunks(masquerade::MAX_RECORD_PAYLOAD) {
+            masquerade::wrap_application_data(chunk, &mut wrapped).map_err(io_error)?;
+        }
+        writer.write_all(&wrapped).await
     } else {
         writer.write_all(payload).await
     }
 }
 
 /// Reads more bytes into `inbound`. Returns `Ok(false)` on a clean,
-/// frame-boundary-aligned end of stream, matching the `read_buf() == 0`
-/// convention of the non-masquerade path.
+/// record-boundary-aligned end of stream, matching the `read_buf() == 0`
+/// convention of the non-masquerade path. In masquerade mode `raw` buffers
+/// the undecoded records, so bytes that arrived together with the
+/// handshake are never lost.
 async fn fill_maybe_wrapped<R>(
     reader: &mut R,
     inbound: &mut BytesMut,
+    raw: &mut BytesMut,
     masquerade: bool,
 ) -> io::Result<bool>
 where
     R: AsyncRead + Unpin,
 {
     if masquerade {
-        match masquerade::read_record(
-            reader,
-            RECORD_APPLICATION_DATA,
-            masquerade::MAX_RECORD_PAYLOAD,
-        )
-        .await
-        {
-            Ok(record) => {
+        loop {
+            if let Some(record) = masquerade::take_record(
+                raw,
+                RECORD_APPLICATION_DATA,
+                masquerade::MAX_RECORD_PAYLOAD,
+            )? {
                 inbound.extend_from_slice(&record);
-                Ok(true)
+                return Ok(true);
             }
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof && inbound.is_empty() => {
-                Ok(false)
+            raw.reserve(READ_CHUNK);
+            if reader.read_buf(raw).await? == 0 {
+                return if raw.is_empty() {
+                    Ok(false)
+                } else {
+                    Err(io::ErrorKind::UnexpectedEof.into())
+                };
             }
-            Err(err) => Err(err),
         }
     } else {
         inbound.reserve(READ_CHUNK);
@@ -173,10 +223,11 @@ pub async fn client_handshake(
     ))
 }
 
-/// Same handshake as [`client_handshake`], but preceded by a real,
-/// browser-shaped TLS ClientHello for `camouflage_sni`, and with every
-/// frame from this point on wrapped in a fake `application_data` TLS
-/// record. See `masquerade.rs` for the framing rationale.
+/// Same Shift handshake as [`client_handshake`], carried inside a TLS 1.3
+/// shaped exchange: a browser-like ClientHello for `camouflage_sni` with
+/// the handshake token and ephemeral key embedded in it, the server's
+/// ServerHello and ChangeCipherSpec in reply, and only then frames wrapped
+/// in `application_data` records. See `masquerade.rs` for the wire format.
 pub async fn client_handshake_masqueraded(
     stream: &mut TcpStream,
     psk: &Psk,
@@ -189,25 +240,35 @@ pub async fn client_handshake_masqueraded(
     let (handshake, init) =
         ClientHandshake::start(psk, server_public, suite, unix_now()).map_err(io_error)?;
     let exchange = async {
-        let hello = masquerade::build_client_hello(camouflage_sni).map_err(io_error)?;
+        let hello = masquerade::build_client_hello(camouflage_sni, &init).map_err(io_error)?;
         stream.write_all(&hello).await?;
-        masquerade::write_application_data(stream, &init.to_bytes()).await?;
-        let reply =
-            masquerade::read_record(stream, RECORD_APPLICATION_DATA, SERVER_REPLY_LEN + 64).await?;
-        Ok::<_, io::Error>(reply)
+        let server_hello =
+            masquerade::read_record(stream, RECORD_HANDSHAKE, masquerade::MAX_SERVER_HELLO_LEN)
+                .await?;
+        let change_cipher_spec =
+            masquerade::read_record(stream, RECORD_CHANGE_CIPHER_SPEC, 1).await?;
+        if change_cipher_spec[0] != 0x01 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected ChangeCipherSpec body",
+            ));
+        }
+        Ok::<_, io::Error>(server_hello)
     };
-    let raw = tokio::time::timeout(timeout, exchange)
+    let server_hello = tokio::time::timeout(timeout, exchange)
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
-    let reply = ServerReply::from_bytes(&raw).map_err(io_error)?;
+    let reply = masquerade::parse_server_hello(&server_hello, &init).map_err(io_error)?;
     let keys = handshake.finish(&reply).map_err(io_error)?;
     let shaper = AdaptiveShaper::new(shaper.clone(), Instant::now()).map_err(io_error)?;
-    Ok(Established::new_with_masquerade(
-        keys.keys,
-        BytesMut::with_capacity(READ_CHUNK),
-        shaper,
-        true,
-    ))
+    let mut session = Established::new_with_masquerade(keys.keys, BytesMut::new(), shaper, true);
+
+    let mut out = BytesMut::from(&masquerade::CHANGE_CIPHER_SPEC_RECORD[..]);
+    session.encode_cover_records(&[masquerade::CLIENT_FINISHED_RECORD_LEN], &mut out)?;
+    tokio::time::timeout(timeout, stream.write_all(&out))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
+    Ok(session)
 }
 
 pub async fn relay<L, R>(local: L, remote: R, session: Established) -> io::Result<()>
@@ -219,6 +280,7 @@ where
         mut encoder,
         mut decoder,
         mut inbound,
+        mut raw,
         mut shaper,
         masquerade,
     } = session;
@@ -263,7 +325,7 @@ where
             while let Some(payload) = decoder.decode(&mut inbound).map_err(io_error)? {
                 local_write.write_all(&payload).await?;
             }
-            if !fill_maybe_wrapped(&mut remote_read, &mut inbound, masquerade).await? {
+            if !fill_maybe_wrapped(&mut remote_read, &mut inbound, &mut raw, masquerade).await? {
                 if inbound.has_remaining() {
                     return Err(io::ErrorKind::UnexpectedEof.into());
                 }
