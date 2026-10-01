@@ -13,7 +13,9 @@ pub struct Cli {
     #[arg(long, env = "SHIFT_FORWARD", default_value = "127.0.0.1:10001")]
     pub forward: SocketAddr,
 
-    #[arg(long, env = "SHIFT_FALLBACK", default_value = "1.1.1.1:443")]
+    /// Decoy target for connections that fail authentication. Used when
+    /// the probe carries no usable SNI, or its SNI target is unreachable.
+    #[arg(long, env = "SHIFT_FALLBACK")]
     pub fallback: SocketAddr,
 
     #[arg(long, env = "SHIFT_PSK")]
