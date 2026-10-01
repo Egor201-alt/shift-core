@@ -73,4 +73,3 @@ impl ShiftError {
 }
 
 pub type Result<T> = std::result::Result<T, ShiftError>;
-
